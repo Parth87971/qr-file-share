@@ -134,29 +134,56 @@
           name: file.name,
           size: file.size,
           type: file.type,
-          data: file.size > 50000 ? 'Demo: File too large for QR. Use server upload.' : 'demo-data',
           timestamp: Date.now()
         };
 
-        if (window.QRCode) {
-          new window.QRCode(qrContainer, {
-            text: JSON.stringify(fileData),
-            width: 256,
-            height: 256,
-            colorDark: '#000000',
-            colorLight: '#ffffff',
-            correctLevel: window.QRCode?.CorrectLevel?.M
-          });
+        if (file.size <= 50000) {  // For small files, encode as base64
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            fileData.data = e.target.result;  // Base64 with MIME
+            createQR(fileData);
+          };
+          reader.readAsDataURL(file);
+        } else {  // For large files, upload to file.io and encode URL
+          const formData = new FormData();
+          formData.append('file', file);
+          fetch('https://file.io/', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(result => {
+              if (result.success) {
+                fileData.url = result.link;
+                createQR(fileData);
+              } else {
+                showNotification('Upload failed—try again.', 'error');
+              }
+            })
+            .catch(() => showNotification('Upload failed—check connection.', 'error'));
+        }
 
-          setTimeout(() => {
-            const canvas = qrContainer.querySelector('canvas');
-            const img = qrContainer.querySelector('img');
-            if (canvas) {
-              setQrCode(canvas.toDataURL());
-            } else if (img) {
-              setQrCode(img.src);
-            }
-          }, 100);
+        function createQR(data) {
+          const jsonString = JSON.stringify(data);
+          if (window.QRCode && jsonString.length < 2953) {  // Max QR capacity for binary ~2953 bytes
+            new window.QRCode(qrContainer, {
+              text: jsonString,
+              width: 256,
+              height: 256,
+              colorDark: '#000000',
+              colorLight: '#ffffff',
+              correctLevel: window.QRCode?.CorrectLevel?.H  // Higher error correction for larger data
+            });
+
+            setTimeout(() => {
+              const canvas = qrContainer.querySelector('canvas');
+              const img = qrContainer.querySelector('img');
+              if (canvas) {
+                setQrCode(canvas.toDataURL());
+              } else if (img) {
+                setQrCode(img.src);
+              }
+            }, 100);
+          } else {
+            showNotification('Data too large for QR—use smaller file or check upload.', 'error');
+          }
         }
       };
 
@@ -212,7 +239,27 @@
                 const data = JSON.parse(code.data);
                 setScanResult(data);
                 stopScanner();
-                showNotification('File received successfully!', 'success');
+                if (data.data && data.data.startsWith('data:')) {
+                  // Download base64 data
+                  const link = document.createElement('a');
+                  link.href = data.data;
+                  link.download = data.name;
+                  document.body.appendChild(link);
+                  link.click();
+                  document.body.removeChild(link);
+                  showNotification('File downloaded successfully!', 'success');
+                } else if (data.url) {
+                  // Download from URL
+                  const link = document.createElement('a');
+                  link.href = data.url;
+                  link.download = data.name;
+                  document.body.appendChild(link);
+                  link.click();
+                  document.body.removeChild(link);
+                  showNotification('File downloaded from link!', 'success');
+                } else {
+                  showNotification('No downloadable content in QR.', 'info');
+                }
                 return;
               } catch (e) {
                 // Continue scanning
@@ -231,7 +278,16 @@
       };
 
       const downloadFile = () => {
-        showNotification('Download started!', 'success');
+        if (scanResult?.data && scanResult.data.startsWith('data:')) {
+          const link = document.createElement('a');
+          link.href = scanResult.data;
+          link.download = scanResult.name;
+          link.click();
+        } else if (scanResult?.url) {
+          window.open(scanResult.url, '_blank');
+        } else {
+          showNotification('No file to download.', 'error');
+        }
       };
 
       return (
