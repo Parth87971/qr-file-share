@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QR File Sender</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-50 text-slate-800 antialiased">
+    <div id="app" class="min-h-screen flex items-center justify-center p-4">
+      <main class="w-full max-w-3xl bg-white rounded-2xl shadow-lg p-6">
+        <header class="flex items-center justify-between mb-4">
+          <h1 class="text-2xl font-semibold">QR File Sender</h1>
+          <div class="text-sm text-slate-500">Drop a file or choose one to start</div>
+        </header>
+
+        <section class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="space-y-3">
+            <label class="block text-sm font-medium">Selected file</label>
+            <div class="border border-dashed border-slate-200 rounded-lg p-4 bg-slate-50">
+              <div v-if="file" class="flex items-start gap-3">
+                <div class="flex-1">
+                  <div class="font-medium">{{ file.name }}</div>
+                  <div class="text-xs text-slate-500">{{ formattedBytes(file.size) }}</div>
+                  <div class="mt-2 text-xs text-slate-600 break-words">{{ userMessage }}</div>
+                </div>
+                <div class="flex flex-col gap-2">
+                  <button @click="clearFile" class="px-3 py-1 rounded bg-red-50 text-red-600 border border-red-100">Remove</button>
+                </div>
+              </div>
+              <div v-else class="text-sm text-slate-500">No file chosen</div>
+
+              <div class="mt-4">
+                <input id="fileInput" type="file" class="hidden" @change="onFileChange" />
+                <div class="flex gap-2">
+                  <label for="fileInput" class="inline-flex items-center gap-2 px-3 py-2 bg-slate-100 rounded cursor-pointer text-sm">Choose file</label>
+                  <button @click="startTransfer" :disabled="!file || isTransferring" class="px-3 py-2 rounded bg-indigo-600 text-white disabled:opacity-50">Start</button>
+                  <button v-if="isTransferring" @click="togglePause" class="px-3 py-2 rounded bg-amber-500 text-white">{{ paused ? 'Resume' : 'Pause' }}</button>
+                  <button v-if="isTransferring" @click="stopTransfer" class="px-3 py-2 rounded bg-rose-600 text-white">Stop</button>
+                </div>
+              </div>
+
+              <div class="mt-3 text-xs text-slate-400">Chunk size: <strong>{{ chunkSize }}</strong> bytes — Set smaller if scanner struggles.</div>
+
+              <div class="mt-3">
+                <label class="text-xs">Chunk size (bytes)</label>
+                <input type="range" min="64" max="1024" step="2" v-model.number="chunkSize" />
+              </div>
+
+            </div>
+
+            <div class="mt-2">
+              <div class="text-sm font-medium">Transfer status</div>
+              <div class="w-full bg-slate-100 rounded overflow-hidden mt-2">
+                <div :style="{ width: progressPercent + '%' }" class="h-2 bg-indigo-500 transition-all"></div>
+              </div>
+              <div class="flex justify-between text-xs text-slate-500 mt-1">
+                <div>{{ transferredChunks }} / {{ totalChunks || 0 }} chunks</div>
+                <div>{{ progressPercent.toFixed(1) }}%</div>
+              </div>
+            </div>
+
+            <div class="mt-3 text-xs text-slate-500">{{ statusMessage }}</div>
+          </div>
+
+          <div class="flex flex-col items-center justify-center">
+            <div id="qrcode" class="bg-white p-4 rounded-lg shadow-inner"></div>
+            <div class="mt-3 text-sm text-slate-600">Show this QR code to the receiver's camera. It updates as chunks are emitted.</div>
+            <details class="mt-4 text-xs text-slate-500 w-full">
+              <summary class="cursor-pointer">Advanced / debug</summary>
+              <div class="mt-2">
+                <pre class="text-xs whitespace-pre-wrap break-words max-h-40 overflow-auto bg-slate-50 p-2 rounded">{{ debugLog.join('\n') }}</pre>
+              </div>
+            </details>
+          </div>
+        </section>
+
+        <footer class="mt-6 text-xs text-slate-500">Static files — deploy to GitHub Pages / Netlify. Works offline in modern browsers.</footer>
+      </main>
+    </div>
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script>
+      const { createApp, ref, reactive, onMounted } = Vue;
+
+      createApp({
+        setup() {
+          const file = ref(null);
+          const userMessage = ref('Choose a file to begin');
+          const isTransferring = ref(false);
+          const paused = ref(false);
+          const chunkSize = ref(250);
+          const qrcode = ref(null);
+
+          const totalChunks = ref(0);
+          const transferredChunks = ref(0);
+          const progressPercent = ref(0);
+          const statusMessage = ref('Idle');
+          const debugLog = ref([]);
+
+          let compressedBytes = null;
+          let emitIndex = 0;
+
+          const formattedBytes = (n) => {
+            if (!n) return '0 B';
+            const units = ['B','KB','MB','GB'];
+            let i=0; let val = n;
+            while (val>=1024 && i<units.length-1){ val/=1024; i++; }
+            return val.toFixed(2)+' '+units[i];
+          };
+
+          const log = (s) => { debugLog.value.unshift(new Date().toLocaleTimeString() + ' - ' + s); if (debugLog.value.length>200) debugLog.value.pop(); };
+
+          function onFileChange(e){
+            const f = e.target.files[0];
+            setFile(f);
+          }
+
+          function setFile(f){
+            file.value = f || null;
+            userMessage.value = f ? `Ready: ${f.name}` : 'Choose a file to begin';
+          }
+
+          function clearFile(){
+            file.value = null;
+            userMessage.value = 'Choose a file to begin';
+          }
+
+          async function prepareData(){
+            statusMessage.value = 'Compressing file...';
+            const buffer = await file.value.arrayBuffer();
+            const gz = pako.gzip(new Uint8Array(buffer), { level: 9 });
+            compressedBytes = gz;
+            totalChunks.value = Math.ceil(gz.length / chunkSize.value);
+            transferredChunks.value = 0;
+            progressPercent.value = 0;
+            log(`Compressed from ${formattedBytes(file.value.size)} to ${formattedBytes(gz.length)} in ${totalChunks.value} chunks`);
+          }
+
+          function makeMetadata(){
+            return JSON.stringify({ name: file.value.name, chunks: totalChunks.value });
+          }
+
+          function encodeChunk(index, bytes){
+            // bytes is Uint8Array
+            const encoded = btoa(String.fromCharCode.apply(null, Array.from(bytes)));
+            return index + ',' + encoded;
+          }
+
+          function emitQRCode(text){
+            if (!qrcode.value) return;
+            qrcode.value.clear();
+            qrcode.value.makeCode(text);
+          }
+
+          async function startTransfer(){
+            if (!file.value) return;
+            isTransferring.value = true;
+            paused.value = false;
+            emitIndex = 0;
+            await prepareData();
+
+            // Send metadata first
+            emitQRCode(makeMetadata());
+            statusMessage.value = 'Sent file metadata — starting chunks...';
+            await new Promise(r => setTimeout(r, 700));
+
+            for (let i=0; i<totalChunks.value; i++){
+              // check stop
+              if (!isTransferring.value) { statusMessage.value='Stopped'; emitQRCode('Stopped'); log('Stopped by user'); break; }
+
+              // pause handling
+              while (paused.value && isTransferring.value){ statusMessage.value='Paused'; await new Promise(r=>setTimeout(r, 200)); }
+
+              const start = i * chunkSize.value;
+              const chunk = compressedBytes.subarray(start, start + chunkSize.value);
+              const payload = encodeChunk(i, chunk);
+              emitQRCode(payload);
+
+              transferredChunks.value = i + 1;
+              progressPercent.value = (transferredChunks.value/totalChunks.value)*100;
+              statusMessage.value = `Transferring chunk ${transferredChunks.value} / ${totalChunks.value}`;
+              log(`Emitted chunk ${i}`);
+
+              // brief delay to let receiver scan
+              await new Promise(r => setTimeout(r, 60));
+            }
+
+            if (isTransferring.value){
+              statusMessage.value = 'Transfer complete';
+              emitQRCode('Transfer complete');
+              log('Transfer completed');
+            }
+            isTransferring.value = false;
+          }
+
+          function stopTransfer(){
+            isTransferring.value = false;
+            paused.value = false;
+            statusMessage.value = 'Stopped by user';
+          }
+
+          function togglePause(){ paused.value = !paused.value; }
+
+          onMounted(()=>{
+            const el = document.getElementById('qrcode');
+            const size = Math.min(window.innerWidth, 420);
+            qrcode.value = new QRCode(el, { text: 'Choose file to get started', width: size, height: size, colorDark: '#111827', colorLight:'#ffffff', correctLevel: QRCode.CorrectLevel.M });
+          });
+
+          return { file, userMessage, isTransferring, startTransfer, stopTransfer, togglePause, paused, onFileChange, clearFile, chunkSize, formattedBytes, transferredChunks, totalChunks, progressPercent, statusMessage, debugLog };
+        }
+      }).mount('#app');
+    </script>
+  </body>
+</html>
