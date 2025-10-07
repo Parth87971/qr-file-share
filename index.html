@@ -31,10 +31,14 @@
       const [scanResult, setScanResult] = useState(null);
       const [notification, setNotification] = useState(null);
       const [isGenerating, setIsGenerating] = useState(false);
+      const [decodedChunks, setDecodedChunks] = useState({});
+      const [fileMetadata, setFileMetadata] = useState({ chunks: 0 });
+      const [userMessage, setUserMessage] = useState('Ready to transfer data.');
       const fileInputRef = useRef(null);
       const videoRef = useRef(null);
       const canvasRef = useRef(null);
       const streamRef = useRef(null);
+      const qrContainerRef = useRef(null);
 
       useEffect(() => {
         let cleanupStream = () => {
@@ -97,31 +101,69 @@
         }
       };
 
-      const processFile = async (file) => {
+      const processFile = (file) => {
         setSelectedFile(file);
         setIsGenerating(true);
         setUploadProgress(0);
-
-        const interval = setInterval(() => {
-          setUploadProgress(prev => {
-            if (prev >= 100) {
-              clearInterval(interval);
-              return 100;
-            }
-            return prev + 10;
-          });
-        }, 100);
-
-        setTimeout(() => {
-          generateQRCode(file);
-          setIsGenerating(false);
-          showNotification('QR Code generated successfully!', 'success');
-          const qrImg = document.getElementById('generated-qr');
-          if (qrImg) qrImg.focus();
-        }, 1500);
+        setDecodedChunks({});
+        setFileMetadata({ chunks: 0 });
+        setUserMessage(`Processing ${file.name} for transfer...`);
+        generateChunks(file);
       };
 
-      const generateQRCode = (file) => {
+      const generateChunks = (file) => {
+        const chunkSize = 2000; // Max ~2953 bytes, leave room for JSON overhead
+        const totalChunks = Math.ceil(file.size / chunkSize);
+        setFileMetadata({ chunks: totalChunks });
+        setUploadProgress(10); // Start progress
+
+        const reader = new FileReader();
+        let chunks = [];
+        let offset = 0;
+
+        reader.onload = (e) => {
+          chunks.push(e.target.result);
+          offset += chunkSize;
+          if (offset < file.size) {
+            readNextChunk();
+          } else {
+            setUploadProgress(50); // Chunking complete
+            startTransfer(chunks, totalChunks, file.name, file.type);
+          }
+        };
+
+        const readNextChunk = () => {
+          const slice = file.slice(offset, offset + chunkSize);
+          reader.readAsArrayBuffer(slice);
+        };
+
+        readNextChunk();
+      };
+
+      const startTransfer = (chunks, totalChunks, fileName, fileType) => {
+        let currentChunk = 0;
+        const interval = setInterval(() => {
+          if (currentChunk < totalChunks) {
+            const chunkData = chunks[currentChunk];
+            const qrData = {
+              chunk: currentChunk,
+              total: totalChunks,
+              data: Array.from(new Uint8Array(chunkData)),
+              name: fileName,
+              type: fileType
+            };
+            generateQR(JSON.stringify(qrData));
+            currentChunk++;
+            setUploadProgress(50 + (currentChunk / totalChunks) * 50);
+          } else {
+            clearInterval(interval);
+            setIsGenerating(false);
+            showNotification('Transfer complete! Scan all QR codes.', 'success');
+          }
+        }, 2000); // 2-second delay between QR generations
+      };
+
+      const generateQR = (data) => {
         let qrContainer = document.getElementById('qr-container');
         if (!qrContainer) {
           qrContainer = document.createElement('div');
@@ -130,98 +172,55 @@
           document.body.appendChild(qrContainer);
         }
         qrContainer.innerHTML = '';
-
-        const fileData = {
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          timestamp: Date.now()
-        };
-
-        if (file.size <= 50000) { // Small files (<50 KB) via base64
-          const reader = new FileReader();
-          reader.onload = (e) => {
-            fileData.data = e.target.result; // Base64 with MIME
-            createQR(fileData);
-          };
-          reader.readAsDataURL(file);
-        } else { // Large files via file.io with fallback to 0x0.st
-          setUploadProgress(50); // Indicate upload start
-          const formData = new FormData();
-          formData.append('file', file);
-          fetch('https://file.io/', { method: 'POST', body: formData })
-            .then(res => res.json())
-            .then(result => {
-              if (result.success) {
-                fileData.url = result.link;
-              } else {
-                return fetch('https://0x0.st/', { method: 'POST', body: formData })
-                  .then(res => res.text())
-                  .then(link => {
-                    if (link.startsWith('https://')) fileData.url = link.trim();
-                    else throw new Error('No valid URL from fallback');
-                  });
-              }
-              createQR(fileData);
-              setUploadProgress(100); // Upload complete
-            })
-            .catch(err => {
-              showNotification('Upload failed: ' + err.message + '. Try a smaller file.', 'error');
-              setUploadProgress(0);
-            });
+        if (window.QRCode && data.length < 2953) {
+          new window.QRCode(qrContainer, {
+            text: data,
+            width: 300,
+            height: 300,
+            colorDark: '#000000',
+            colorLight: '#ffffff',
+            correctLevel: window.QRCode?.CorrectLevel?.H
+          });
+          setTimeout(() => {
+            const canvas = qrContainer.querySelector('canvas');
+            const img = qrContainer.querySelector('img');
+            if (canvas) {
+              setQrCode(canvas.toDataURL());
+            } else if (img) {
+              setQrCode(img.src);
+            }
+          }, 100);
+        } else {
+          showNotification('Data too large for QR.', 'error');
         }
+      };
 
-        function createQR(data) {
-          const jsonString = JSON.stringify(data);
-          if (window.QRCode && jsonString.length < 2953) { // Max QR capacity
-            new window.QRCode(qrContainer, {
-              text: jsonString,
-              width: 300,
-              height: 300,
-              colorDark: '#000000',
-              colorLight: '#ffffff',
-              correctLevel: window.QRCode?.CorrectLevel?.H
-            });
-            setTimeout(() => {
-              const canvas = qrContainer.querySelector('canvas');
-              const img = qrContainer.querySelector('img');
-              if (canvas) {
-                setQrCode(canvas.toDataURL());
-              } else if (img) {
-                setQrCode(img.src);
-              }
-            }, 100);
-          } else {
-            showNotification('Data too large for QR—reduce file size or check upload.', 'error');
-          }
-        }
+      const stopTransfer = () => {
+        setIsGenerating(false);
+        setUploadProgress(0);
+        setQrCode('');
+        showNotification('Transfer stopped.', 'info');
       };
 
       const startScanner = async () => {
         console.log("Starting scanner...");
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ 
-            video: { facingMode: 'environment' } // Prefer rear camera
-          }).catch(() => navigator.mediaDevices.getUserMedia({ video: true })); // Fallback to any
+            video: { facingMode: 'environment' }
+          }).catch(() => navigator.mediaDevices.getUserMedia({ video: true }));
           console.log("Camera stream obtained:", stream);
           if (videoRef.current) {
             videoRef.current.srcObject = stream;
             videoRef.current.play().catch(err => console.error("Play error:", err));
-            videoRef.current.muted = true; // Required for mobile auto-play
+            videoRef.current.muted = true;
             streamRef.current = stream;
             setIsScanning(true);
-            console.log("Is scanning set, video ready:", videoRef.current.readyState);
-            setTimeout(() => {
-              const stopBtn = document.getElementById('stop-scanner-btn');
-              if (stopBtn) stopBtn.focus();
-            }, 500);
+            setUserMessage('Scanning for QR codes...');
             scanQRCode();
-          } else {
-            console.log("videoRef.current is null");
           }
         } catch (err) {
           console.error("Camera error:", err.name, err.message);
-          showNotification('Camera access failed: ' + err.message + '. Ensure permissions are granted.', 'error');
+          showNotification('Camera access failed: ' + err.message + '. Check permissions.', 'error');
         }
       };
 
@@ -231,6 +230,7 @@
           streamRef.current = null;
         }
         setIsScanning(false);
+        setUserMessage('Scanner stopped.');
       };
 
       const scanQRCode = () => {
@@ -252,9 +252,20 @@
             if (code) {
               try {
                 const data = JSON.parse(code.data);
-                setScanResult(data);
-                stopScanner();
-                showNotification('QR scanned! Click Download to save.', 'info');
+                if (data.chunk !== undefined && data.total !== undefined && data.data) {
+                  setDecodedChunks(prev => {
+                    if (!prev[data.chunk]) {
+                      const newChunks = { ...prev, [data.chunk]: data.data };
+                      if (Object.keys(newChunks).length === data.total) {
+                        assembleFile(newChunks, data.name, data.type);
+                      }
+                      return newChunks;
+                    }
+                    return prev;
+                  });
+                  setFileMetadata({ chunks: data.total });
+                  showNotification(`Chunk ${data.chunk + 1} of ${data.total} received.`, 'success');
+                }
               } catch (e) {
                 console.error("JSON parse error:", e);
               }
@@ -265,21 +276,29 @@
         requestAnimationFrame(scanQRCode);
       };
 
+      const assembleFile = (chunks, fileName, fileType) => {
+        const sortedChunks = Object.values(chunks).sort((a, b) => a.chunk - b.chunk);
+        const byteArrays = sortedChunks.map(chunk => new Uint8Array(chunk));
+        const fullArray = new Uint8Array(byteArrays.reduce((acc, curr) => acc.concat(Array.from(curr)), []));
+        const blob = new Blob([fullArray], { type: fileType });
+        const url = URL.createObjectURL(blob);
+        setScanResult({ name: fileName, data: url });
+        showNotification(`${fileName} assembled! Click Download.`, 'success');
+      };
+
       const downloadFile = () => {
-        if (!scanResult) return showNotification('No file scanned.', 'error');
-        if (scanResult.data && scanResult.data.startsWith('data:')) {
+        if (!scanResult) return showNotification('No file to download.', 'error');
+        if (scanResult.data && scanResult.data.startsWith('blob:')) {
           const link = document.createElement('a');
           link.href = scanResult.data;
           link.download = scanResult.name;
           document.body.appendChild(link);
           link.click();
           document.body.removeChild(link);
+          URL.revokeObjectURL(scanResult.data); // Cleanup
           showNotification(`${scanResult.name} downloaded!`, 'success');
-        } else if (scanResult.url) {
-          window.open(scanResult.url, '_blank');
-          showNotification(`Downloading ${scanResult.name} from secure link...`, 'success');
         } else {
-          showNotification('No downloadable data—regenerate QR.', 'error');
+          showNotification('No downloadable file available.', 'error');
         }
       };
 
@@ -316,7 +335,7 @@
             </header>
 
             <section aria-label="Features" className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-              {[{ icon: <i className="fas fa-bolt w-5 h-5" aria-hidden="true"></i>, text: 'Instant Transfer' }, { icon: <i className="fas fa-shield-alt w-5 h-5" aria-hidden="true"></i>, text: 'Secure & Private' }, { icon: <i className="fas fa-wifi w-5 h-5" aria-hidden="true"></i>, text: 'No Internet Needed (Small Files)' }, { icon: <i className="fas fa-mobile w-5 h-5" aria-hidden="true"></i>, text: 'Cross-Platform' }].map((feature, i) => (
+              {[{ icon: <i className="fas fa-bolt w-5 h-5" aria-hidden="true"></i>, text: 'Instant Transfer' }, { icon: <i className="fas fa-shield-alt w-5 h-5" aria-hidden="true"></i>, text: 'Secure & Private' }, { icon: <i className="fas fa-wifi w-5 h-5" aria-hidden="true"></i>, text: 'No Internet Needed' }, { icon: <i className="fas fa-mobile w-5 h-5" aria-hidden="true"></i>, text: 'Cross-Platform' }].map((feature, i) => (
                 <div key={i} className="bg-white/10 backdrop-blur-sm rounded-xl p-3 flex items-center gap-2 text-white animate-fadeInUp" style={{ animationDelay: `${i * 100}ms` }}>
                   {feature.icon}
                   <span className="text-sm font-medium">{feature.text}</span>
@@ -369,10 +388,10 @@
                   {uploadProgress > 0 && uploadProgress < 100 && (
                     <div className="animate-fadeIn">
                       <div className="flex justify-between text-sm text-gray-600 mb-2">
-                        <span>Uploading...</span>
-                        <span>{uploadProgress}%</span>
+                        <span>Generating Chunks...</span>
+                        <span>{Math.round(uploadProgress)}%</span>
                       </div>
-                      <div className="h-3 bg-gray-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={uploadProgress} aria-label="Upload progress">
+                      <div className="h-3 bg-gray-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={uploadProgress} aria-label="Chunk generation progress">
                         <div className="h-full bg-gradient-to-r from-purple-500 to-blue-500 transition-all duration-300 relative" style={{ width: `${uploadProgress}%` }}>
                           <div className="absolute inset-0 bg-white/30 animate-shimmer" aria-hidden="true"></div>
                         </div>
@@ -381,48 +400,42 @@
                   )}
 
                   {selectedFile && qrCode && (
-                    <div className="grid md:grid-cols-2 gap-6 animate-fadeInUp">
+                    <div className="space-y-6">
                       <div className="bg-gradient-to-br from-purple-50 to-blue-50 rounded-2xl p-6">
                         <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
                           <i className="fas fa-file-text w-5 h-5 text-purple-600" aria-hidden="true"></i>
-                          File Information
+                          Data Sender Mode
                         </h3>
-                        <div className="space-y-3">
-                          <div className="flex items-center gap-3">
-                            <div className="p-2 bg-white rounded-lg">
-                              {getFileIcon(selectedFile.type)}
-                            </div>
-                            <div className="flex-1">
-                              <p className="font-medium text-gray-800 truncate">{selectedFile.name}</p>
-                              <p className="text-sm text-gray-500">{formatFileSize(selectedFile.size)} • {selectedFile.type || 'Unknown type'}</p>
-                            </div>
-                          </div>
-                          <div className="pt-3 border-t border-purple-100">
-                            <button onClick={copyShareLink} className="w-full flex items-center justify-center gap-2 py-2 px-4 bg-white text-purple-600 rounded-lg hover:bg-purple-50 transition-colors">
-                              <i className="fas fa-copy w-4 h-4" aria-hidden="true"></i>
-                              <span>Copy Share Link</span>
-                            </button>
-                          </div>
+                        <p className="text-gray-600 mb-4">{userMessage}</p>
+                        <div className="text-center">
+                          <p className="text-sm text-gray-500 mb-2">Progress: {isGenerating ? Object.keys(decodedChunks).length : 0} / {fileMetadata.chunks || 0}</p>
+                          <button onClick={() => processFile(selectedFile)} disabled={isGenerating} className="inline-flex items-center gap-2 px-8 py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-xl font-semibold shadow-lg hover:shadow-xl transform hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                            <i className="fas fa-play w-5 h-5" aria-hidden="true"></i>
+                            <span>Start Transfer</span>
+                          </button>
+                          <button onClick={stopTransfer} disabled={!isGenerating} className="ml-4 inline-flex items-center gap-2 px-8 py-3 bg-red-500 text-white rounded-xl font-semibold hover:bg-red-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                            <i className="fas fa-stop w-5 h-5" aria-hidden="true"></i>
+                            <span>Stop Transfer</span>
+                          </button>
                         </div>
                       </div>
-
                       <div className="bg-gradient-to-br from-blue-50 to-cyan-50 rounded-2xl p-6 text-center">
                         <h3 className="font-semibold text-gray-800 mb-4">Scan to Download</h3>
                         {isGenerating ? (
-                          <div className="w-64 h-64 mx-auto bg-gray-200 rounded-xl animate-pulse" aria-hidden="true"></div>
-                        ) : (
                           <div className="relative inline-block">
                             <div className="absolute inset-0 bg-gradient-to-r from-purple-400 to-blue-400 rounded-xl blur-xl opacity-30 animate-pulse" aria-hidden="true"></div>
                             <img
                               id="generated-qr"
                               tabIndex={-1}
                               src={qrCode}
-                              alt={`QR code for ${selectedFile.name}. Expires in 5 minutes.`}
+                              alt={`QR code for ${selectedFile.name} chunk.`}
                               className="relative w-64 h-64 mx-auto rounded-xl shadow-lg p-4 bg-white"
                             />
                           </div>
+                        ) : (
+                          <div className="w-64 h-64 mx-auto bg-gray-200 rounded-xl animate-pulse" aria-hidden="true"></div>
                         )}
-                        <p className="text-sm text-gray-500 mt-4">QR code expires in 5 minutes</p>
+                        <p className="text-sm text-gray-500 mt-4">Scan each QR code to receive data</p>
                       </div>
                     </div>
                   )}
@@ -431,17 +444,24 @@
 
               {activeTab === 'receive' && (
                 <div className="space-y-6 animate-fadeIn">
-                  {!isScanning && !scanResult && (
-                    <div className="text-center py-12">
-                      <i className="fas fa-camera w-20 h-20 mx-auto mb-4 text-blue-500" aria-hidden="true"></i>
-                      <h3 className="text-xl font-semibold text-gray-800 mb-2">Ready to Receive Files</h3>
-                      <p className="text-gray-500 mb-6">Scan a QR code to receive files. Ensure camera access is allowed.</p>
-                      <button onClick={startScanner} className="inline-flex items-center gap-2 px-8 py-3 bg-gradient-to-r from-blue-600 to-cyan-600 text-white rounded-xl font-semibold shadow-lg hover:shadow-xl transform hover:scale-105 transition-all">
-                        <i className="fas fa-camera w-5 h-5" aria-hidden="true"></i>
-                        <span>Start Scanner</span>
+                  <div className="bg-gradient-to-br from-blue-50 to-cyan-50 rounded-2xl p-6">
+                    <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                      <i className="fas fa-download w-5 h-5 text-blue-600" aria-hidden="true"></i>
+                      Data Receiver Mode
+                    </h3>
+                    <p className="text-gray-600 mb-4">{userMessage}</p>
+                    <div className="text-center">
+                      <p className="text-sm text-gray-500 mb-2">Progress: {Object.keys(decodedChunks).length} / {fileMetadata.chunks || 0}</p>
+                      <button onClick={startScanner} disabled={isScanning} className="inline-flex items-center gap-2 px-8 py-3 bg-gradient-to-r from-blue-600 to-cyan-600 text-white rounded-xl font-semibold shadow-lg hover:shadow-xl transform hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                        <i className="fas fa-play w-5 h-5" aria-hidden="true"></i>
+                        <span>Start Receiver</span>
+                      </button>
+                      <button onClick={stopScanner} disabled={!isScanning} className="ml-4 inline-flex items-center gap-2 px-8 py-3 bg-red-500 text-white rounded-xl font-semibold hover:bg-red-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                        <i className="fas fa-stop w-5 h-5" aria-hidden="true"></i>
+                        <span>Stop Receiver</span>
                       </button>
                     </div>
-                  )}
+                  </div>
 
                   {isScanning && (
                     <div className="relative rounded-2xl overflow-hidden bg-black">
@@ -463,7 +483,7 @@
                           <div className="p-2 bg-gradient-to-br from-blue-100 to-cyan-100 rounded-lg">{getFileIcon(scanResult.type)}</div>
                           <div className="flex-1">
                             <p className="font-medium text-gray-800">{scanResult.name}</p>
-                            <p className="text-sm text-gray-500">{formatFileSize(scanResult.size)}</p>
+                            <p className="text-sm text-gray-500">{formatFileSize(new Blob([new Uint8Array(scanResult.data)]).size)}</p>
                           </div>
                         </div>
                       </div>
@@ -473,23 +493,6 @@
                       </button>
                     </div>
                   )}
-
-                  <div className="mt-4">
-                    <label htmlFor="paste-url" className="block text-sm font-medium text-gray-700 mb-2">Or paste a QR URL:</label>
-                    <input
-                      id="paste-url"
-                      type="text"
-                      placeholder="Enter file.io or 0x0.st link"
-                      className="w-full p-2 border rounded-lg"
-                      onChange={(e) => {
-                        const url = e.target.value.trim();
-                        if (url && (url.startsWith('https://file.io/') || url.startsWith('https://0x0.st/'))) {
-                          setScanResult({ name: 'File from URL', url });
-                          showNotification('URL detected! Click Download to save.', 'info');
-                        }
-                      }}
-                    />
-                  </div>
                 </div>
               )}
             </section>
@@ -497,7 +500,7 @@
             <section className="mt-12 bg-white/90 backdrop-blur-md rounded-3xl p-8 animate-fadeInUp" aria-labelledby="how-title">
               <h2 id="how-title" className="text-2xl font-bold text-gray-800 mb-6 text-center">How It Works</h2>
               <div className="grid md:grid-cols-3 gap-6">
-                {[{ step: '1', title: 'Select File', description: 'Choose any file from your device', icon: <i className="fas fa-upload w-6 h-6" aria-hidden="true"></i> }, { step: '2', title: 'Generate QR', description: 'Create a QR code for sharing', icon: <i className="fas fa-qrcode w-6 h-6" aria-hidden="true"></i> }, { step: '3', title: 'Scan & Download', description: 'Scan to receive the file', icon: <i className="fas fa-download w-6 h-6" aria-hidden="true"></i> }].map((item, i) => (
+                {[{ step: '1', title: 'Select File', description: 'Choose any file from your device', icon: <i className="fas fa-upload w-6 h-6" aria-hidden="true"></i> }, { step: '2', title: 'Generate QR', description: 'Create QR codes for chunks', icon: <i className="fas fa-qrcode w-6 h-6" aria-hidden="true"></i> }, { step: '3', title: 'Scan & Download', description: 'Scan all chunks to receive', icon: <i className="fas fa-download w-6 h-6" aria-hidden="true"></i> }].map((item, i) => (
                   <div key={i} className="relative">
                     <div className="text-center">
                       <div className="inline-flex items-center justify-center w-16 h-16 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-full mb-4 shadow-lg">{item.icon}</div>
