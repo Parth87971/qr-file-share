@@ -3,7 +3,7 @@ window.startTransfer = (file, setQrCode, setUploadProgress, setIsGenerating, set
   setUploadProgress(0);
   setUserMessage(`Processing ${file.name} for transfer...`);
 
-  const chunkSize = 2000; // Adjusted for 13 KB files with JSON overhead
+  const chunkSize = 1000; // Reduced to fit within QR limit with base64
   const totalChunks = Math.ceil(file.size / chunkSize);
   setFileMetadata({ chunks: totalChunks });
   setUploadProgress(10);
@@ -28,11 +28,6 @@ window.startTransfer = (file, setQrCode, setUploadProgress, setIsGenerating, set
     reader.readAsArrayBuffer(slice);
   };
 
-  const readNextChunk = () => {
-    const slice = file.slice(offset, offset + chunkSize);
-    reader.readAsArrayBuffer(slice);
-  };
-
   readNextChunk();
 
   function generateQRs(chunks, totalChunks, fileName, fileType) {
@@ -40,11 +35,12 @@ window.startTransfer = (file, setQrCode, setUploadProgress, setIsGenerating, set
     const interval = setInterval(() => {
       if (currentChunk < totalChunks) {
         const chunkData = chunks[currentChunk];
+        const base64Data = btoa(String.fromCharCode(...new Uint8Array(chunkData)));
         const qrData = {
           chunk: currentChunk,
           total: totalChunks,
-          data: Array.from(new Uint8Array(chunkData)).slice(0, 1800), // Limit data to fit QR
-          name: fileName.substring(0, 50), // Limit name length
+          data: base64Data,
+          name: fileName.substring(0, 50),
           type: fileType
         };
         const jsonData = JSON.stringify(qrData);
@@ -64,21 +60,19 @@ window.startTransfer = (file, setQrCode, setUploadProgress, setIsGenerating, set
             height: 300,
             colorDark: '#000000',
             colorLight: '#ffffff',
-            correctLevel: window.QRCode?.CorrectLevel?.H
+            correctLevel: window.QRCode.CorrectLevel.H
           });
           setTimeout(() => {
             const canvas = qrContainer.querySelector('canvas');
-            const img = qrContainer.querySelector('img');
             if (canvas) {
               setQrCode(canvas.toDataURL());
-            } else if (img) {
-              setQrCode(img.src);
             } else {
-              console.log("No canvas or img found");
+              console.error("QR canvas not found");
+              showNotification('Failed to generate QR code.', 'error');
             }
-          }, 100);
+          }, 500); // Increased timeout to ensure QR renders
         } else {
-          showNotification('Chunk too large for QR—adjusting chunk size.', 'error');
+          showNotification('Data too large for QR.', 'error');
           clearInterval(interval);
           setIsGenerating(false);
           setUploadProgress(0);
